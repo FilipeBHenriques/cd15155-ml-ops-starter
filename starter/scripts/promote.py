@@ -1,57 +1,34 @@
-"""
-Promote the latest version of the registered model to Production
-if the weighted F1 score from the most recent evaluation run exceeds
-the required threshold.
+"""Promote the latest registered model when latest evaluation F1 meets threshold."""
+import os
 
-Run:
-    python scripts/promote.py
-"""
-# TODO: Write a script that :
-# 1- reads the F1 threshold from params.yaml,
-# 2- fetches the weighted F1 score from the most recent MLflow evaluation run,
-# 3- promotes the latest model version to a "production" alias if the score
-# meets the threshold.
-# 4- Print a clear message when the model does not qualify.
-# Documentation: https://mlflow.org/docs/latest/model-registry.html
-
+import mlflow
 import yaml
 from dotenv import load_dotenv
 from mlflow.tracking import MlflowClient
 
-load_dotenv()
-
-
-def load_params() -> dict:
-    with open("params.yaml") as f:
-        return yaml.safe_load(f)["promote"]
-
-
-def get_latest_f1(client: MlflowClient, experiment_name: str) -> tuple[str, float]:
-    """
-    Return the run_id and f1_weighted of the most recent evaluation run.
-    """
-    # TODO: Look up the experiment by name, search for the most recent run,
-    # and return its run_id and f1_weighted metric value.
-    # Documentation: https://mlflow.org/docs/latest/api_reference/python_api/mlflow.client.html
-    raise NotImplementedError
-
-
+load_dotenv(override=True)
+def load_params():
+    with open("params.yaml", encoding="utf-8") as f: return yaml.safe_load(f)["promote"]
+def get_latest_f1(client: MlflowClient, experiment_name: str):
+    exp = client.get_experiment_by_name(experiment_name)
+    if exp is None: raise RuntimeError(f"MLflow experiment not found: {experiment_name}")
+    runs = client.search_runs([exp.experiment_id], order_by=["attributes.start_time DESC"], max_results=1)
+    if not runs or "f1_weighted" not in runs[0].data.metrics: raise RuntimeError("No evaluation run with f1_weighted metric was found")
+    return runs[0].info.run_id, float(runs[0].data.metrics["f1_weighted"])
 def promote(client: MlflowClient, model_name: str):
-    # TODO: Fetch all registered versions of the model, identify the latest one,
-    # and assign it the "production" alias using the MLflow client.
-    # Documentation: https://mlflow.org/docs/latest/ml/model-registry/
-
-    # get the latest version of the model
-    raise NotImplementedError
-
-
+    versions = client.search_model_versions(f"name='{model_name}'")
+    if not versions: raise RuntimeError(f"No registered versions found for model {model_name}")
+    latest = max(versions, key=lambda v: int(v.version))
+    client.set_registered_model_alias(model_name, "production", latest.version)
+    print(f"Promoted {model_name} version {latest.version} to alias 'production'")
 def main():
-    # TODO: Write the main function:
-    # 1- load the threshold from params.yaml,
-    # 2- call get_latest_f1(),
-    # 3- call promote() only if the threshold is met.
-    raise NotImplementedError
-
-
-if __name__ == "__main__":
-    main()
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+    client = MlflowClient()
+    threshold = float(load_params()["f1_threshold"])
+    experiment = os.getenv("MLFLOW_EXPERIMENT_NAME", "finbert-evaluation")
+    model_name = os.getenv("MODEL_NAME", "finbert")
+    run_id, f1 = get_latest_f1(client, experiment)
+    print(f"Latest evaluation run {run_id}: f1_weighted={f1:.4f}; threshold={threshold:.4f}")
+    if f1 >= threshold: promote(client, model_name)
+    else: print(f"Model not promoted: F1 {f1:.4f} does not meet threshold {threshold:.4f}.")
+if __name__ == "__main__": main()

@@ -28,7 +28,7 @@ def download_and_patch_model(model_id: str) -> None:
         config = json.load(f)
 
     config["id2label"] = {"0": "negative", "1": "neutral", "2": "positive"}
-    config["label2id"] = {"negative": "0", "neutral": "1", "positive": "2"}
+    config["label2id"] = {"negative": 0, "neutral": 1, "positive": 2}
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
@@ -53,7 +53,7 @@ def check_model():
         assert result and result[0]["label"] in {"positive", "negative", "neutral"}
         print(f"Model loaded and inference OK  -->  {result[0]}")
         return True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - report any failure as a failed smoke test
         print(f"[FAIL] Model check failed: {e}")
         return False
 
@@ -61,7 +61,7 @@ def check_model():
 def main():
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(override=True)
 
     print("=" * 50)
     print("  FinBERT Market Smoke Test")

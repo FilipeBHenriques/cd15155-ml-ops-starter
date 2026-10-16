@@ -13,7 +13,7 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 def load_params() -> dict:

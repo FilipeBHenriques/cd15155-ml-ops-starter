@@ -1,139 +1,118 @@
-"""
-Sentiment Prediction API.
-
-Endpoints:
-    GET  /health          — service health status
-    POST /predict         — single headline sentiment
-    POST /predict/batch   — batch headline sentiment
-    GET  /metrics         — Prometheus metrics
-"""
-
+"""FinBERT sentiment prediction API with Prometheus instrumentation."""
+import json
+import logging
 import os
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
 from utils import load_classifier
 
-# TODO (Task 6)
-# Configure the Python logger using basicConfig.
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
+_logger = logging.getLogger("finbert-api")
 
-
-# TODO (Task 6)
-# Implement a structured logging helper that emits each log entry as a JSON
-# object containing at least a timestamp, level, and message field.
 def log(level: str, message: str, **kwargs) -> None:
-    pass
+    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "message": message, **kwargs}
+    getattr(_logger, level.lower(), _logger.info)(json.dumps(entry, default=str))
 
-
-# TODO (Task 6)
-# Define the following Prometheus metrics:
-# 1. A Counter for the total number of prediction requests, labelled by sentiment.
-# 2. A Histogram for prediction latency in milliseconds.
-# 3. A Counter for the total number of prediction errors.
-# Then instrument run_predictions() to update each metric accordingly.
-# Documentation: https://prometheus.io/docs/concepts/metric_types/
-PREDICTION_REQUESTS = None
-PREDICTION_LATENCY = None
-PREDICTION_ERRORS = None
-
-load_dotenv()
-
+PREDICTION_REQUESTS = Counter("prediction_requests_total", "Total predictions by sentiment", ["sentiment"])
+PREDICTION_LATENCY = Histogram("prediction_latency_ms", "Prediction latency in milliseconds", buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, float("inf")))
+PREDICTION_ERRORS = Counter("prediction_errors_total", "Total prediction errors")
+load_dotenv(override=True)
 classifiers = {}
-
 
 class PredictRequest(BaseModel):
     text: str
-
-
 class PredictBatchRequest(BaseModel):
     texts: list[str]
-
-
 class PredictionResult(BaseModel):
     text: str
     sentiment: str
     confidence: float
     latency_ms: float
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log("INFO", "Loading model...")
-    classifiers["sentiment"] = load_classifier()
-    log("INFO", "Model loaded successfully")
+    try:
+        log("INFO", "Loading model")
+        classifiers["sentiment"] = load_classifier()
+        log("INFO", "Model loaded successfully")
+    except Exception as exc:  # noqa: BLE001 - keep API alive on any load failure
+        classifiers.pop("sentiment", None)
+        log("ERROR", "Model loading failed", error=str(exc))
+        # Keep the API alive so health checks can report 503 and orchestration can restart it.
     yield
     classifiers.clear()
     log("INFO", "Model unloaded")
 
-
 app = FastAPI(title="Sentiment Analysis API", lifespan=lifespan)
 
-
 def run_predictions(texts: list[str]) -> list[PredictionResult]:
+    if "sentiment" not in classifiers:
+        raise HTTPException(status_code=503, detail="Model is not loaded")
+    if any(not isinstance(t, str) or not t.strip() for t in texts):
+        raise HTTPException(status_code=422, detail="Text must not be empty")
     try:
-        # TODO (Task 3): Log a warning using log() if any input text exceeds 2000
-        # characters — the model will silently truncate it, so this makes it visible.
+        for text in texts:
+            if len(text) > 2000:
+                log("WARNING", "Input exceeds 2000 characters; model may truncate input", text_length=len(text))
+        start = time.perf_counter()
+        outputs = classifiers["sentiment"](texts if len(texts) > 1 else texts[0], batch_size=32, truncation=True)
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        per_item_ms = elapsed_ms / max(1, len(texts))
+        results = []
+        for text, output in zip(texts, outputs):
+            sentiment = str(output["label"]).lower()
+            confidence = float(output["score"])
+            PREDICTION_REQUESTS.labels(sentiment=sentiment).inc()
+            PREDICTION_LATENCY.observe(per_item_ms)
+            result = PredictionResult(text=text, sentiment=sentiment, confidence=confidence, latency_ms=round(per_item_ms, 3))
+            results.append(result)
+            log("INFO", "Prediction completed", sentiment=sentiment, confidence=confidence, latency_ms=result.latency_ms)
+        return results
+    except HTTPException:
+        raise
+    except Exception as exc:
+        PREDICTION_ERRORS.inc()
+        log("ERROR", "Prediction failed", error=str(exc))
+        raise
 
-        # TODO (Task 3): Record the start time, run batch inference using
-        # classifiers["sentiment"], and compute latency_ms from start to finish.
+# Keep singular helper available for callers/tests expecting run_prediction.
+def run_prediction(text: str):
+    result = run_predictions([text])[0]
+    return {"label": result.sentiment, "score": result.confidence}, result.latency_ms
 
-        # TODO (Task 3): Build and return a list of PredictionResult objects from
-        # the inference results (each result has "label" and "score" keys).
-
-        # TODO (Task 6): Observe latency_ms on PREDICTION_LATENCY and increment
-        # PREDICTION_REQUESTS (labelled by sentiment) for each prediction.
-
-        # TODO (Task 6): Log each prediction using log() with sentiment, confidence,
-        # and latency_ms fields.
-        raise NotImplementedError
-    except Exception as e:
-        # TODO (Task 6): Increment PREDICTION_ERRORS, log the error using log(),
-        # then re-raise.
-        raise e
-
-
-# TODO (Task 6): Implement the /metrics endpoint.
-# Return the Prometheus metrics in the correct format using generate_latest()
-# and CONTENT_TYPE_LATEST.
-# Documentation: https://prometheus.io/docs/instrumenting/exposition_formats/
 @app.get("/metrics")
 def metrics():
-    raise NotImplementedError
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-
-# TODO: Implement the /health endpoint.
-# Return {"status": "ok"} when the model
-# is loaded, and raise an HTTP 503 error when it is not.
 @app.get("/health")
 def health():
-    raise NotImplementedError
+    if "sentiment" not in classifiers:
+        raise HTTPException(status_code=503, detail="Model is not loaded")
+    return {"status": "ok"}
 
-
-# TODO: Implement the POST /predict endpoint.
-# Accept a PredictRequest and return a PredictionResult.
-# Return HTTP 503 if the model is not loaded
-# Return HTTP 422 if the text is empty
 @app.post("/predict", response_model=PredictionResult)
 def predict(request: PredictRequest):
-    raise NotImplementedError
+    if not request.text.strip():
+        raise HTTPException(status_code=422, detail="Text must not be empty")
+    return run_predictions([request.text])[0]
 
-
-# TODO: Implement the POST /predict/batch endpoint.
-# Accept a PredictBatchRequest and return a list of PredictionResult.
-# Return HTTP 503 if the model is not loaded
-# and HTTP 422 if the texts list is empty.
 @app.post("/predict/batch", response_model=list[PredictionResult])
 def predict_batch(request: PredictBatchRequest):
-    raise NotImplementedError
-
+    if not request.texts:
+        raise HTTPException(status_code=422, detail="Texts list must not be empty")
+    if any(not text.strip() for text in request.texts):
+        raise HTTPException(status_code=422, detail="Texts must not be empty")
+    return run_predictions(request.texts)
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        app,
-        host=os.getenv("API_HOST", "0.0.0.0"),
-        port=int(os.getenv("API_PORT", 8000)),
-    )
+    uvicorn.run(app, host=os.getenv("API_HOST", "0.0.0.0"), port=int(os.getenv("API_PORT", "8000")))
