@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -17,7 +17,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 _logger = logging.getLogger("finbert-api")
 
 def log(level: str, message: str, **kwargs) -> None:
-    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "level": level.upper(), "message": message, **kwargs}
+    entry = {"timestamp": datetime.now(UTC).isoformat(), "level": level.upper(), "message": message, **kwargs}
     getattr(_logger, level.lower(), _logger.info)(json.dumps(entry, default=str))
 
 PREDICTION_REQUESTS = Counter("prediction_requests_total", "Total predictions by sentiment", ["sentiment"])
